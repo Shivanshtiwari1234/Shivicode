@@ -1,212 +1,207 @@
 #include <windows.h>
 #include <gl/GL.h>
-
-#include <array>
+#include <vector>
 #include <string>
-#include <stdexcept>
+#include <array>
 
-// ================= Input State =================
-struct InputState
-{
+// ================= Input =================
+struct InputState {
     std::array<bool, 256> keys{};
     std::string text;
-
-    void beginFrame()
-    {
-        text.clear();
-    }
-
-    bool isDown(unsigned vk) const
-    {
-        return vk < keys.size() && keys[vk];
-    }
+    void beginFrame() { text.clear(); }
+    bool down(int vk) const { return vk < 256 && keys[vk]; }
 };
 
-// ================= Editor Buffer =================
-struct EditorBuffer
-{
-    std::string text;
+// ================= Editor =================
+struct Editor {
+    std::vector<std::string> lines{""};
+    size_t row = 0, col = 0;
 
-    void insert(const std::string& s)
-    {
-        text += s;
+    void insert(char c) {
+        lines[row].insert(lines[row].begin() + col, c);
+        col++;
     }
 
-    void backspace()
-    {
-        if (!text.empty())
-            text.pop_back();
-    }
-};
-
-// ================= RAII OpenGL Context =================
-struct GLContext
-{
-    HDC   hdc   = nullptr;
-    HGLRC hglrc = nullptr;
-    HWND  hwnd  = nullptr;
-
-    GLContext(HWND window) : hwnd(window)
-    {
-        hdc = GetDC(hwnd);
-        if (!hdc) throw std::runtime_error("GetDC failed");
-
-        PIXELFORMATDESCRIPTOR pfd{};
-        pfd.nSize = sizeof(pfd);
-        pfd.nVersion = 1;
-        pfd.dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL; // single buffer
-        pfd.iPixelType = PFD_TYPE_RGBA;
-        pfd.cColorBits = 32;
-
-        int pf = ChoosePixelFormat(hdc, &pfd);
-        if (!pf || !SetPixelFormat(hdc, pf, &pfd))
-            throw std::runtime_error("Pixel format failed");
-
-        hglrc = wglCreateContext(hdc);
-        if (!hglrc || !wglMakeCurrent(hdc, hglrc))
-            throw std::runtime_error("OpenGL context failed");
+    void newline() {
+        std::string tail = lines[row].substr(col);
+        lines[row].erase(col);
+        lines.insert(lines.begin() + row + 1, tail);
+        row++;
+        col = 0;
     }
 
-    ~GLContext()
-    {
-        if (hglrc)
-        {
-            wglMakeCurrent(nullptr, nullptr);
-            wglDeleteContext(hglrc);
+    void backspace() {
+        if(col>0){
+            lines[row].erase(col-1,1);
+            col--;
+        } else if(row>0){
+            col = lines[row-1].size();
+            lines[row-1] += lines[row];
+            lines.erase(lines.begin()+row);
+            row--;
         }
-        if (hdc && hwnd)
-            ReleaseDC(hwnd, hdc);
     }
-
-    GLContext(const GLContext&) = delete;
-    GLContext& operator=(const GLContext&) = delete;
 };
 
-// ================= Window Procedure =================
-LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
-{
-    auto* input = reinterpret_cast<InputState*>(
-        GetWindowLongPtr(hwnd, GWLP_USERDATA)
-    );
+// ================= Fullscreen State =================
+struct FullscreenState {
+    bool active=false;
+    DWORD style{};
+    RECT rect{};
+};
 
-    switch (msg)
-    {
-    case WM_CREATE:
-    {
-        auto* cs = reinterpret_cast<CREATESTRUCT*>(lParam);
-        SetWindowLongPtr(hwnd, GWLP_USERDATA,
-            reinterpret_cast<LONG_PTR>(cs->lpCreateParams));
-        return 0;
+// ================= Window Proc =================
+LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    auto* input = reinterpret_cast<InputState*>(GetWindowLongPtr(hwnd,GWLP_USERDATA));
+    switch(msg){
+        case WM_CREATE:
+            SetWindowLongPtr(hwnd,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCT*)lParam)->lpCreateParams);
+            return 0;
+        case WM_KEYDOWN:
+            if(input && wParam<256) input->keys[wParam]=true;
+            return 0;
+        case WM_KEYUP:
+            if(input && wParam<256) input->keys[wParam]=false;
+            return 0;
+        case WM_CHAR:
+            if(input) input->text.push_back((char)wParam);
+            return 0;
+        case WM_DESTROY:
+            PostQuitMessage(0);
+            return 0;
     }
-
-    case WM_KEYDOWN:
-        if (input && wParam < 256)
-            input->keys[wParam] = true;
-        return 0;
-
-    case WM_KEYUP:
-        if (input && wParam < 256)
-            input->keys[wParam] = false;
-        return 0;
-
-    case WM_CHAR:
-        if (input)
-            input->text.push_back(static_cast<char>(wParam));
-        return 0;
-
-    case WM_DESTROY:
-        PostQuitMessage(0);
-        return 0;
-    }
-
-    return DefWindowProc(hwnd, msg, wParam, lParam);
+    return DefWindowProc(hwnd,msg,wParam,lParam);
 }
 
-// ================= Entry Point =================
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
-{
-    try
-    {
-        const char* CLASS_NAME = "ShivicodeWindow";
+// ================= OpenGL Font =================
+GLuint fontBase = 0;
+void initFont(HDC hdc){
+    fontBase = glGenLists(256);
+    HFONT hFont = CreateFontA(
+        -18,0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
+        ANSI_CHARSET,OUT_TT_PRECIS,CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY,FF_DONTCARE,"Consolas"
+    );
+    SelectObject(hdc,hFont);
+    wglUseFontBitmaps(hdc,0,256,fontBase);
+    DeleteObject(hFont);
+}
 
-        WNDCLASS wc{};
-        wc.style = CS_OWNDC;
-        wc.lpfnWndProc = WindowProc;
-        wc.hInstance = hInstance;
-        wc.lpszClassName = CLASS_NAME;
+void renderText(const std::string &text, float x, float y){
+    glRasterPos2f(x,y);
+    glPushAttrib(GL_LIST_BIT);
+    glListBase(fontBase);
+    glCallLists((GLsizei)text.size(), GL_UNSIGNED_BYTE, text.c_str());
+    glPopAttrib();
+}
 
-        RegisterClass(&wc);
+// ================= Entry =================
+int WINAPI WinMain(HINSTANCE hInst,HINSTANCE hPrevInstance,LPSTR lpCmdLine,int nShowCmd){
+    const char* CLASS = "ShivicodeWnd";
+    WNDCLASS wc{};
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInst;
+    wc.lpszClassName = CLASS;
+    wc.style = CS_OWNDC;
+    RegisterClass(&wc);
 
-        InputState input;
-        EditorBuffer editor;
+    InputState input;
+    Editor editor;
+    FullscreenState fs;
 
-        HWND hwnd = CreateWindowEx(
-            0,
-            CLASS_NAME,
-            "Shivicode — Made in C++, made for C++",
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT, CW_USEDEFAULT,
-            800, 600,
-            nullptr, nullptr,
-            hInstance,
-            &input
-        );
+    HWND hwnd = CreateWindowEx(
+        0, CLASS, "Shivicode OpenGL Editor",
+        WS_OVERLAPPEDWINDOW|WS_VISIBLE,
+        100,100,900,600,
+        nullptr,nullptr,hInst,&input
+    );
 
-        if (!hwnd)
-            throw std::runtime_error("CreateWindowEx failed");
+    ShowWindow(hwnd,nShowCmd);
+    UpdateWindow(hwnd);
 
-        GLContext gl(hwnd);
+    // OpenGL init
+    HDC hdc = GetDC(hwnd);
+    PIXELFORMATDESCRIPTOR pfd{};
+    pfd.nSize=sizeof(pfd);
+    pfd.nVersion=1;
+    pfd.dwFlags=PFD_DRAW_TO_WINDOW|PFD_SUPPORT_OPENGL|PFD_DOUBLEBUFFER;
+    pfd.iPixelType=PFD_TYPE_RGBA;
+    pfd.cColorBits=32;
+    int pf = ChoosePixelFormat(hdc,&pfd);
+    SetPixelFormat(hdc,pf,&pfd);
 
-        HFONT font = CreateFontA(
-            18, 0, 0, 0,
-            FW_NORMAL,
-            FALSE, FALSE, FALSE,
-            ANSI_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            DEFAULT_QUALITY,
-            FF_DONTCARE,
-            "Consolas"
-        );
+    HGLRC rc = wglCreateContext(hdc);
+    wglMakeCurrent(hdc,rc);
 
-        MSG msg{};
-        while (GetMessage(&msg, nullptr, 0, 0) > 0)
-        {
-            input.beginFrame();
+    // Top-left origin
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    glOrtho(0,900,600,0,-1,1);
+    glMatrixMode(GL_MODELVIEW); glLoadIdentity();
 
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
+    initFont(hdc); // AFTER window is visible
 
-            // ---- Update editor ----
-            if (!input.text.empty())
-                editor.insert(input.text);
+    MSG msg{};
+    static bool f11Prev=false, backPrev=false;
 
-            if (input.isDown(VK_BACK))
-                editor.backspace();
+    while(GetMessage(&msg,nullptr,0,0)){
+        input.beginFrame();
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
 
-            // ---- Render ----
-            glClearColor(0.12f, 0.12f, 0.15f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            glFlush();
+        // ---------- F11 fullscreen ----------
+        bool f11Now = input.down(VK_F11);
+        if(f11Now && !f11Prev){
+            if(!fs.active){
+                fs.style = GetWindowLong(hwnd,GWL_STYLE);
+                GetWindowRect(hwnd,&fs.rect);
+                SetWindowLong(hwnd,GWL_STYLE,WS_POPUP|WS_VISIBLE);
 
-            SelectObject(gl.hdc, font);
-            SetBkMode(gl.hdc, TRANSPARENT);
-            SetTextColor(gl.hdc, RGB(220, 220, 220));
+                MONITORINFO mi{}; mi.cbSize = sizeof(mi);
+                if(GetMonitorInfo(MonitorFromWindow(hwnd,MONITOR_DEFAULTTOPRIMARY),&mi)){
+                    SetWindowPos(hwnd,HWND_TOP,mi.rcMonitor.left,mi.rcMonitor.top,
+                                 mi.rcMonitor.right-mi.rcMonitor.left,
+                                 mi.rcMonitor.bottom-mi.rcMonitor.top,
+                                 SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_SHOWWINDOW);
+                }
+                fs.active = true;
+            }else{
+                SetWindowLong(hwnd,GWL_STYLE,fs.style);
+                SetWindowPos(hwnd,HWND_TOP,fs.rect.left,fs.rect.top,
+                             fs.rect.right-fs.rect.left,
+                             fs.rect.bottom-fs.rect.top,
+                             SWP_NOOWNERZORDER|SWP_FRAMECHANGED|SWP_SHOWWINDOW);
+                fs.active = false;
+            }
+        }
+        f11Prev = f11Now;
 
-            TextOutA(
-                gl.hdc,
-                10, 10,
-                editor.text.c_str(),
-                (int)editor.text.size()
-            );
+        // ---------- Input → Editor ----------
+        for(char c : input.text){
+            if(c=='\r') continue;
+            if(c=='\n') editor.newline();
+            else editor.insert(c);
+        }
+        bool backNow = input.down(VK_BACK);
+        if(backNow && !backPrev) editor.backspace();
+        backPrev = backNow;
+
+        // ---------- Render ----------
+        glClearColor(0.10f,0.11f,0.14f,1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glLoadIdentity();
+
+        float y = 20.0f;
+        for(const auto &line : editor.lines){
+            renderText(line, 10.0f, y);
+            y += 20.0f;
         }
 
-        DeleteObject(font);
-        return 0;
+        SwapBuffers(hdc);
     }
-    catch (...)
-    {
-        MessageBoxA(nullptr, "Fatal error", "Shivicode", MB_ICONERROR);
-        return -1;
-    }
+
+    wglMakeCurrent(nullptr,nullptr);
+    wglDeleteContext(rc);
+    ReleaseDC(hwnd,hdc);
+
+    return 0;
 }
