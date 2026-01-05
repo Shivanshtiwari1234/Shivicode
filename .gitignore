@@ -1,5 +1,3 @@
-build.bat
+run.bat
 shivicode.exe
-*.log
-*.tmp
-.vscode/
+
